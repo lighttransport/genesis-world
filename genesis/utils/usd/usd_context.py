@@ -15,6 +15,7 @@ from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 import genesis as gs
 import genesis.utils.mesh as mu
 
+from .usd_filtered_pairs import build_collision_filter_bits
 from .usd_material import parse_material_preview_surface
 from .usd_utils import extract_scale
 
@@ -127,6 +128,12 @@ class UsdContext:
         self._xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
         self._is_yup = UsdGeom.GetStageUpAxis(self._stage) == "Y"
         self._meter_scale = UsdGeom.GetStageMetersPerUnit(self._stage)
+        # Bit-pack UsdPhysicsFilteredPairsAPI relations into per-prim
+        # contype / conaffinity via the same Z3 SAT solver Genesis uses
+        # for MJCF <contact><exclude> (mjcf.py:677-701). Empty when the
+        # stage has no filtered pairs; parse_prim_geoms then falls back
+        # to the historical 1/1 default.
+        self._collision_group_bits = build_collision_filter_bits(self._stage)
 
     @property
     def stage(self) -> Usd.Stage:
@@ -134,6 +141,13 @@ class UsdContext:
         Get the USD stage object.
         """
         return self._stage
+
+    def get_collision_group_bits(self, prim_path: str):
+        """Per-prim (contype, conaffinity) bit-pair from
+        UsdPhysicsCollisionGroup membership. Returns None if the prim
+        is not in any collision group; the caller falls back to its
+        own default (1/1 collider, 0/0 visual)."""
+        return self._collision_group_bits.get(prim_path)
 
     @property
     def stage_file(self) -> str:

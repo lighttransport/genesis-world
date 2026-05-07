@@ -320,29 +320,34 @@ def parse_prim_geoms(
         is_collision = is_visible and (match_collision or not (match_collision or match_visual))
 
         g_infos = links_g_infos[link_path_to_idx[str(link_prim.GetPath())]]
+        # UsdPhysicsFilteredPairsAPI bit-pack overrides the historical
+        # 1/1 default — see usd_filtered_pairs.build_collision_filter_bits.
+        cg_bits = context.get_collision_group_bits(str(prim.GetPath()))
         if is_visual:
+            v_ct, v_ca = (cg_bits if cg_bits is not None else (0, 0))
             for mesh in meshes:
                 g_infos.append(
                     dict(
                         vmesh=mesh,
                         pos=geom_pos,
                         quat=geom_quat,
-                        contype=0,
-                        conaffinity=0,
+                        contype=v_ct,
+                        conaffinity=v_ca,
                         type=gs_type,
                         data=geom_data,
                     )
                 )
         if is_collision:
             # TODO: use "physics:material:binding" (UsdPhysicsMaterialAPI) to extract frictions
+            c_ct, c_ca = (cg_bits if cg_bits is not None else (1, 1))
             for mesh in meshes:
                 g_infos.append(
                     dict(
                         mesh=mesh,
                         pos=geom_pos,
                         quat=geom_quat,
-                        contype=1,
-                        conaffinity=1,
+                        contype=c_ct,
+                        conaffinity=c_ca,
                         type=gs_type,
                         data=geom_data,
                         friction=gu.default_friction(),
