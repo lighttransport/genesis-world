@@ -272,6 +272,24 @@ def get_usd_cache_dir():
     return os.path.join(get_cache_dir(), "usd")
 
 
+def get_quadrants_cache_dir(fast_math: bool = True):
+    """Directory for Quadrants' persistent kernel (offline) cache.
+
+    The compiled kernel artifacts are lowered, target-specific IR. They are NOT portable across
+    GPU architectures / driver versions, so the path is namespaced by everything that affects
+    codegen (backend arch, Quadrants version, Genesis version, float precision, fast-math). A
+    mismatch therefore lands in a fresh directory rather than risking a wrong-binary load.
+    """
+    qd_version = getattr(qd, "__version__", "0")
+    if isinstance(qd_version, (tuple, list)):
+        qd_version = ".".join(map(str, qd_version))
+    precision = "fp64" if gs.qd_float == qd.f64 else "fp32"
+    key = "_".join(
+        (gs.backend.name, f"qd{qd_version}", f"gs{gs.__version__}", precision, "fm1" if fast_math else "fm0")
+    )
+    return os.path.join(get_cache_dir(), "quadrants", key)
+
+
 def geometric_mean(a, b):
     """Geometric mean of two non-negative values: sqrt(a * b)."""
     if a < 0 or b < 0:

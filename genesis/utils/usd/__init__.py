@@ -50,3 +50,4 @@ except ImportError as e:
 from .usd_stage import parse_usd_stage
 from .usd_rigid_entity import parse_usd_rigid_entity
 from .usd_context import UsdContext, HAS_OMNIVERSE_KIT_SUPPORT
+from .usd_export import export_scene_to_usd

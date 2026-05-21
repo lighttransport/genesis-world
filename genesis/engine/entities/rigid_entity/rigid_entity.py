@@ -129,7 +129,7 @@ class KinematicEntity(Entity):
         """Load a single morph into the entity."""
         if isinstance(morph, gs.morphs.Mesh):
             self._load_mesh(morph, self._surface)
-        elif isinstance(morph, (gs.morphs.MJCF, gs.morphs.URDF, gs.morphs.Drone, gs.morphs.USD)):
+        elif isinstance(morph, (gs.morphs.MJCF, gs.morphs.URDF, gs.morphs.Drone, gs.morphs.USD, gs.morphs._Compiled)):
             self._load_scene(morph, self._surface)
         elif isinstance(morph, gs.morphs.Primitive):
             self._load_primitive(morph, self._surface)
@@ -510,6 +510,14 @@ class KinematicEntity(Entity):
         )
 
     def _parse_scene(self, morph, surface):
+        # Fast-path: a compiled-scene morph carries the already-parsed, already-post-processed link/joint/geom
+        # info dicts (with final collision meshes). Return them verbatim, bypassing all asset parsing and
+        # normalization. Collision post-processing and link alignment are skipped downstream (see
+        # `_postprocess_geoms_info` and `_align_link`); SDF is restored from the `.gsd` cache.
+        if isinstance(morph, gs.morphs._Compiled):
+            cd = morph.compiled_data
+            return cd["l_infos"], cd["links_j_infos"], cd["links_g_infos"], cd["eqs_info"]
+
         # Keep track of whether parsed inertia can be considered valid
         is_inertia_invalid = True
 
@@ -921,6 +929,11 @@ class KinematicEntity(Entity):
             if morph.visualization and not is_col:
                 vg_infos.append(g_info)
 
+        # Fast-path: collision geometries from a compiled-scene bundle are already final (convexified /
+        # decomposed / decimated / merged). Skip post-processing entirely and use them as-is.
+        if isinstance(morph, gs.morphs._Compiled):
+            return cg_infos, vg_infos
+
         # Post-process all collision meshes at once.
         # Destroying the original geometries should be avoided if possible as it will change the way objects
         # interact with the world due to only computing one contact point per convex geometry. The idea is to
@@ -966,6 +979,10 @@ class KinematicEntity(Entity):
         j_infos, cg_infos, and vg_infos in-place so that kinematic and rigid entities
         share the same aligned qpos and link frame definition.
         """
+        # Fast-path: compiled-scene geoms/links were captured *after* alignment, so re-aligning would
+        # double-apply the transform. Skip it.
+        if isinstance(morph, gs.morphs._Compiled):
+            return
         align = morph.align if isinstance(morph, gs.options.morphs.FileMorph) else False
         if align is None:
             # Auto: True for basic rigid objects (root with free joint only, no articulated descendants)
@@ -2158,6 +2175,9 @@ class RigidEntity(KinematicEntity):
         self._equalities = gs.List()
         self._requires_jac_and_IK = self._morph.requires_jac_and_IK
         self._is_local_collision_mask = isinstance(self._morph, gs.morphs.MJCF)
+        if isinstance(self._morph, gs.morphs._Compiled):
+            # Restore the contype/conaffinity interpretation captured from the source morph.
+            self._is_local_collision_mask = self._morph.compiled_data.get("is_local_collision_mask", False)
 
         super()._load_model()
 

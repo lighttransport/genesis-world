@@ -134,6 +134,23 @@ class Nowhere(Morph):
     n_particles: StrictInt = Field(ge=1)
 
 
+############################ Compiled ############################
+class _Compiled(Morph):
+    """Carries a pre-built ("compiled") rigid entity for the fast-path loader. Internal use only.
+
+    Created by :func:`genesis.utils.compiled_scene.load_compiled_scene`. When an entity is loaded from
+    a compiled-scene bundle, all the expensive asset parsing, collision post-processing (convex
+    decomposition / decimation / merging) and SDF computation have already been done and serialized.
+    The reconstructed ``l_infos`` / ``links_j_infos`` / ``links_g_infos`` (with final collision meshes)
+    are carried here in ``compiled_data`` so that ``RigidEntity._parse_scene`` short-circuits to them and
+    ``_postprocess_geoms_info`` / ``_align_link`` are skipped. SDF arrays are restored separately via the
+    ``.gsd`` cache. Not meant to be instantiated directly.
+    """
+
+    batch_fixed_verts: StrictBool = False
+    compiled_data: Any = Field(default=None, exclude=True, repr=False)
+
+
 ############################ Shape Primitives ############################
 
 

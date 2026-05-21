@@ -1476,6 +1476,42 @@ class Scene(RBC):
 
         return arrays
 
+    def save_compiled(self, path: str | os.PathLike) -> str:
+        """Serialize this built scene's rigid entities to a portable compiled-scene bundle.
+
+        The bundle captures the result of asset parsing, collision post-processing (convex
+        decomposition / decimation / merging) and SDF computation, so it can be reloaded with
+        :func:`genesis.load_compiled_scene` without redoing that work. See
+        :mod:`genesis.utils.compiled_scene` for details and limitations.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Destination directory for the bundle (conventionally suffixed ``.gscene``).
+        """
+        from genesis.utils.compiled_scene import save_compiled_scene
+
+        return save_compiled_scene(self, path)
+
+    def export_usd(self, path: str | os.PathLike, *, overwrite: bool = True) -> str:
+        """Export this built scene's rigid entities to a USD stage (Z-up, meters).
+
+        The stage can be re-imported with :meth:`add_stage` / ``gs.morphs.USD``. Links, joints, collision
+        and visual geometry are authored with ``UsdPhysics`` APIs. Materials are exported as display color
+        only. For an exact-fidelity, device-independent round-trip use :meth:`save_compiled` instead. See
+        :mod:`genesis.utils.usd.usd_export`. Requires the ``usd-core`` package.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Output USD file (``.usd`` / ``.usda`` / ``.usdc``).
+        overwrite : bool
+            Overwrite an existing file at ``path`` (default True).
+        """
+        from genesis.utils.usd import export_scene_to_usd
+
+        return export_scene_to_usd(self, path, overwrite=overwrite)
+
     def save_checkpoint(self, path: str | os.PathLike) -> None:
         """
         Pickle the full physics state to *one* file.

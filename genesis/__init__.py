@@ -64,6 +64,7 @@ def init(
     theme="dark",
     logger_verbose_time=False,
     performance_mode=False,
+    offline_cache=None,
 ):
     global _initialized
     if _initialized:
@@ -134,6 +135,14 @@ def init(
     is_ndarray_disabled = os.environ.get("GS_ENABLE_NDARRAY", "1") == "0"
     _use_ndarray = not (is_ndarray_disabled or performance_mode)
     use_ndarray = _use_ndarray
+
+    # Resolve the persistent kernel (offline) cache flag. Quadrants only generates a stable, cross-process
+    # cache key in dynamic-array mode; in static/field mode kernels re-specialize per scene so the on-disk
+    # cache never hits. We therefore gate offline caching on `use_ndarray` and auto-disable it otherwise.
+    _offline_cache_env = os.environ.get("GS_OFFLINE_CACHE")
+    if offline_cache is None:
+        offline_cache = _offline_cache_env != "0" if _offline_cache_env is not None else True
+    use_offline_cache = bool(offline_cache) and use_ndarray
 
     # Unlike dynamic vs static array mode, and fastcache, zero-copy can be toggle on/off between init without issue
     _use_zerocopy = bool(int(os.environ["GS_ENABLE_ZEROCOPY"])) if "GS_ENABLE_ZEROCOPY" in os.environ else None
@@ -254,6 +263,27 @@ def init(
         qd_init_kwargs.update(
             random_seed=seed,
         )
+
+    # Quadrants already enables its persistent kernel cache by default (`offline_cache`/`src_ll_cache`),
+    # which is what makes the JIT compilation triggered by the first `scene.build()` step reusable across
+    # processes. Here we (1) expose an explicit Genesis-level toggle so it can be disabled (e.g. when
+    # debugging compilation), and (2) relocate the cache under Genesis' own cache root (honoring
+    # `GS_CACHE_FILE_PATH`/`XDG_CACHE_HOME`) instead of the standalone `~/.cache/quadrants`, namespaced by
+    # backend arch + Quadrants/Genesis version + precision + fast-math so incompatible artifacts never
+    # collide. The env-var interface mirrors what CI already relies on (see .github/workflows/*.yml).
+    if use_offline_cache:
+        from .utils.misc import get_quadrants_cache_dir
+
+        _offline_cache_dir = os.environ.get("QD_OFFLINE_CACHE_FILE_PATH")
+        if _offline_cache_dir is None:
+            _offline_cache_dir = get_quadrants_cache_dir(fast_math=not debug)
+            os.environ["QD_OFFLINE_CACHE_FILE_PATH"] = _offline_cache_dir
+        os.makedirs(_offline_cache_dir, exist_ok=True)
+        os.environ.setdefault("QD_OFFLINE_CACHE", "1")
+        os.environ.setdefault("QD_OFFLINE_CACHE_CLEANING_POLICY", "lru")
+        logger.debug(f"[Quadrants] Persistent kernel cache enabled at ~~<{_offline_cache_dir}>~~.")
+    else:
+        os.environ["QD_OFFLINE_CACHE"] = "0"
 
     # init quadrants
     qd_debug = debug and (os.environ.get("QD_DEBUG") != "0")
@@ -508,6 +538,8 @@ from .grad.creation_ops import *
 from .engine import states, materials, force_fields
 from .engine.mesh import Mesh
 from .engine.scene import Scene
+
+from .utils.compiled_scene import save_compiled_scene, load_compiled_scene
 
 from . import recorders
 
