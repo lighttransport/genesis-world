@@ -1,4 +1,5 @@
 import ctypes
+import dataclasses
 import datetime
 import functools
 import io
@@ -9,7 +10,7 @@ import os
 import random
 import sys
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import field
 from importlib import import_module
 from itertools import combinations
@@ -24,6 +25,7 @@ import torch
 
 
 import genesis as gs
+from genesis.typing import is_sequence
 
 
 LOGGER = logging.getLogger(__name__)
@@ -234,6 +236,19 @@ def fits_in_gpu_shared_memory(*dims: int) -> bool:
     return math.prod(dims) * itemsize <= qd.lang.impl.get_max_shared_memory_bytes(is_lowerbound_ok=True)
 
 
+def get_entry_point_name():
+    """
+    Name of the script the process was launched from, without directory nor extension.
+
+    Falls back to 'genesis' whenever the process has no script to be named after, as when running interactively or
+    through 'python -c', so that a name derived from it is always a valid filename.
+    """
+    entry_point = sys.argv[0]
+    if not os.path.isfile(entry_point):
+        return "genesis"
+    return os.path.splitext(os.path.basename(entry_point))[0]
+
+
 def get_src_dir():
     return os.path.dirname(gs.__file__)
 
@@ -294,6 +309,10 @@ def get_remesh_cache_dir():
 
 def get_wt_cache_dir():
     return os.path.join(get_cache_dir(), "wt")
+
+
+def get_wth_cache_dir():
+    return os.path.join(get_cache_dir(), "wth")
 
 
 def get_exr_cache_dir():
@@ -408,8 +427,48 @@ def tensor_to_array(x: torch.Tensor, dtype: type[np.generic] | None = None) -> n
     return np.asarray(tensor_to_cpu(x), dtype=dtype)
 
 
+def data_to_array(data):
+    """Recursively move any GPU tensor nested in ``data`` to a CPU numpy array, preserving container structure."""
+    if isinstance(data, torch.Tensor):
+        return tensor_to_array(data)
+    if isinstance(data, np.ndarray):
+        return data
+    if isinstance(data, Mapping):
+        return {k: data_to_array(v) for k, v in data.items()}
+    if is_sequence(data):
+        return type(data)(data_to_array(v) for v in data)
+    return data
+
+
 def is_approx_multiple(a, b, tol=1e-7):
     return abs(a % b) < tol or abs(b - (a % b)) < tol
+
+
+def gaussian_crosstalk_kernel(n_rows: int, n_cols: int, sigma: float, spacing: float | tuple[float, float] = 1.0):
+    """
+    Build an L1-normalized 2D Gaussian convolution kernel for spatial tactile crosstalk.
+
+    The kernel is a discrete isotropic Gaussian ``exp(-(d / sigma)**2 / 2)`` sampled on an ``n_rows x n_cols`` grid
+    centered on the self taxel, then normalized to sum 1 (so a uniform field passes through unchanged). Pass the
+    result as a sensor's ``crosstalk_kernel`` to spread each taxel's signal onto its neighbors.
+
+    ``n_rows`` and ``n_cols`` must be odd so the kernel has a center tap (the self weight). ``spacing`` is the taxel
+    pitch in the same units as ``sigma`` (a scalar, or ``(row_spacing, col_spacing)`` for an anisotropic grid);
+    default ``1.0`` measures ``sigma`` in taxel cells.
+    """
+    if n_rows % 2 == 0 or n_cols % 2 == 0:
+        raise_exception(
+            f"gaussian_crosstalk_kernel requires odd n_rows, n_cols (center tap); got ({n_rows}, {n_cols})."
+        )
+    if sigma <= 0.0:
+        raise_exception(f"gaussian_crosstalk_kernel requires sigma > 0; got {sigma}.")
+    s_row, s_col = (spacing, spacing) if isinstance(spacing, numbers.Number) else spacing
+    rows = (np.arange(n_rows, dtype=float) - n_rows // 2) * s_row
+    cols = (np.arange(n_cols, dtype=float) - n_cols // 2) * s_col
+    g_row = np.exp(-(rows**2) / (2.0 * sigma * sigma))
+    g_col = np.exp(-(cols**2) / (2.0 * sigma * sigma))
+    kernel = np.outer(g_row, g_col)
+    return kernel / kernel.sum()
 
 
 def concat_with_tensor(
@@ -432,7 +491,9 @@ def concat_with_tensor(
         and all(e_1 == e_2 for i, (e_1, e_2) in enumerate(zip(tensor.shape, value.shape)) if e_1 > 0 and i != dim)
     )
     if tensor.numel() == 0:
-        return value
+        # 'expand' leaves a zero stride on the broadcast dimensions, so materialize to get a real table supporting
+        # in-place writes on a subset of the rows and usable as a kernel argument
+        return value.contiguous()
     return torch.cat([tensor, value], dim=dim)
 
 
@@ -458,6 +519,42 @@ def make_tensor_field(shape: tuple[int, ...] = (), dtype_factory: Callable[[], t
     return field(default_factory=_default_factory)
 
 
+def get_default_screen(display=None):
+    """Return the screen a window should be created on, for the given pyglet display or the default one.
+
+    Leaving the display out selects whichever pyglet itself would use, headless included, which is what creating a
+    window must go through. Passing one explicitly is for callers that need a specific backend, such as the native
+    display backing a physical screen size.
+
+    MacOS enumerates only the displays that are awake, so every one of them being asleep, as happens while the screen
+    is locked, leaves pyglet with no screen at all and no way to open a window. Such a display is still online and
+    accepts a window all the same, hence the fallback, which keeps the interactive viewer available on a locked
+    machine. The main display is preferred throughout.
+    """
+    # The display namespace moved from 'pyglet.canvas' to 'pyglet.display' in pyglet 2.0.
+    displays = pyglet.canvas if pyglet.version < "2.0" else pyglet.display
+    if display is None:
+        display = displays.get_display()
+
+    try:
+        return display.get_default_screen()
+    except IndexError:
+        if pyglet.compat_platform != "darwin":
+            raise
+
+        from pyglet.libs.darwin.cocoapy import CGDirectDisplayID, quartz
+
+        CocoaScreen = import_module(f"{displays.__name__}.cocoa").CocoaScreen
+        display_ids = (CGDirectDisplayID * 256)()
+        num_displays = ctypes.c_uint32()
+        quartz.CGGetOnlineDisplayList(len(display_ids), display_ids, ctypes.byref(num_displays))
+        if not num_displays.value:
+            raise
+        online_ids = [display_ids[i] for i in range(num_displays.value)]
+        main_id = quartz.CGMainDisplayID()
+        return CocoaScreen(display, main_id if main_id in online_ids else online_ids[0])
+
+
 def try_get_display_size() -> tuple[int | None, int | None, float | None]:
     """
     Try to connect to display if it exists and get the screen size.
@@ -473,10 +570,10 @@ def try_get_display_size() -> tuple[int | None, int | None, float | None]:
     screen_scale : float | None
         The scale of the screen.
     """
-    # Resolve pyglet's native display backend directly (under 'pyglet.canvas' before 2.0, 'pyglet.display' from 2.0 on),
-    # never the placeholder headless one whose finalizer calls eglTerminate on the EGL display the offscreen renderers
-    # share. A headless process then raises here, reported as no display - the fallback to a default size is the
-    # viewer's concern. Reuse a display pyglet already has open if any (the isinstance check skips a headless one).
+    # Resolve pyglet's native display backend directly, never the placeholder headless one whose finalizer calls
+    # eglTerminate on the EGL display the offscreen renderers share. A headless process then raises here, reported as
+    # no display - the fallback to a default size is the viewer's concern. Reuse a display pyglet already has open if
+    # any (the isinstance check skips a headless one).
     native = {
         "darwin": ("cocoa", "CocoaDisplay"),
         "win32": ("win32", "Win32Display"),
@@ -488,16 +585,13 @@ def try_get_display_size() -> tuple[int | None, int | None, float | None]:
     # The backend submodule depends on the platform and pyglet version, and a foreign-platform one fails to import
     # (e.g. 'win32' off Windows needs Windows-only ctypes), so it cannot be a top-level import; resolving it by
     # computed name avoids a platform-by-version tree of local imports.
-    if pyglet.version < "2.0":
-        Display = getattr(import_module(f"pyglet.canvas.{native[0]}"), native[1])
-        display = next((d for d in pyglet.canvas._displays if isinstance(d, Display)), None)
-    else:
-        Display = getattr(import_module(f"pyglet.display.{native[0]}"), native[1])
-        display = next((d for d in pyglet.display._displays if isinstance(d, Display)), None)
+    displays = pyglet.canvas if pyglet.version < "2.0" else pyglet.display
+    Display = getattr(import_module(f"{displays.__name__}.{native[0]}"), native[1])
+    display = next((d for d in displays._displays if isinstance(d, Display)), None)
     if display is None:
         display = Display()
 
-    screen = display.get_default_screen()
+    screen = get_default_screen(display)
     if pyglet.version < "2.0":
         screen_scale = 1.0
     else:
@@ -520,17 +614,26 @@ def has_display() -> bool:
 
 
 def indices_to_mask(
-    *indices: Any, keepdim: bool = True, to_torch: bool = True, boolean_mask: bool = False, raise_if_fancy: bool = False
+    *indices: Any, keepdim: bool = True, to_torch: bool = True, boolean_mask: bool = True, raise_if_fancy: bool = False
 ) -> tuple[slice | int | torch.Tensor, ...]:
     """Converts a sequence of slice-like objects into a multi-dimensional mask corresponding to their cross-product.
+
+    Out-of-bound access is not asserted at runtime: checking it would require reading the indices back from the GPU,
+    which stalls the GPU and dramatically impedes performance, in exchange for catching a mistake that should never
+    happen in production. On the contrary, an index outside the valid range selects nothing instead of raising an
+    error, and so does a range or slice counted from the end whose start lies past its stop.
 
     Args:
         keepdim (bool): Whether to keep all dimensions even if masks are integers. Defaults to True.
         to_torch (bool): Whether to force casting collections to torch.Tensor.
-        boolean_mask (bool): Whether boolean mask are supported more must be converted to indices via `torch.nonzero`.
-        raise_if_fancy (bool): Whether fancy indexing is supported for should raise an exception.
-        copy (bool, optional): Wether to raise an exception if the resulting mask requires advanced indexing (aka. fancy
-        indexing), which would trigger a copy when extracting slice.
+        boolean_mask (bool): Whether a boolean mask may be returned as it is. Defaults to True. Set it to False when
+        the mask is given to something that only accepts indices, such as a kernel that has no masked variant.
+        Converting a boolean mask to indices counts its selected entries on the device and reads that count back, which
+        synchronizes the GPU. It should be avoided at all cost because it would significantly impede performance,
+        especially for massively parallel applications like reinforcement learning. A mask selecting on several axes at
+        once is always converted, because the cross-product needs one index per axis.
+        raise_if_fancy (bool): Whether to raise if the resulting mask requires advanced indexing (aka. fancy
+        indexing), which would make extracting a slice copy.
     """
     mask: list[slice | int | torch.Tensor] = []
 
@@ -551,7 +654,9 @@ def indices_to_mask(
                 arg = slice(arg.start, arg.stop, arg.step)
             elif arg_type is int:
                 if keepdim:
-                    arg = slice(arg, arg + 1)
+                    # The last row has no next index to stop at, so its slice runs to the end: `slice(-1, 0)` would
+                    # name nothing at all.
+                    arg = slice(arg, arg + 1 if arg != -1 else None)
             else:  # np.ndarray, torch.tensor, list, tuple, np.int32...
                 try:
                     is_torch_, is_numpy_ = False, False
@@ -566,14 +671,18 @@ def indices_to_mask(
                     else:
                         is_scalar_ = len(arg) == 1
                     if is_scalar_:
-                        arg = slice(idx := arg.item() if is_torch_ or is_numpy_ else arg[0], idx + 1)
+                        idx = arg.item() if is_torch_ or is_numpy_ else arg[0]
+                        arg = slice(idx, idx + 1 if idx != -1 else None)
                     else:
                         if raise_if_fancy:
                             gs.raise_exception("This mask requires advanced indexing but 'raise_if_fancy=True'.")
                         if not is_torch_ and to_torch:
                             # Must convert masks to torch if not slice or int since torch will do it anyway.
                             # Note that being contiguous is not required and does not affect performance.
-                            arg = torch.tensor(arg, dtype=gs.tc_int, device=gs.device)
+                            # int64 is what torch indexes with: a narrower index is widened on every use, and the
+                            # in-place fills these masks feed take no other width. A caller that goes on to hand its
+                            # mask to a kernel pays for a second instantiation of it, this width beside the solver's.
+                            arg = torch.tensor(arg, dtype=torch.int64, device=gs.device)
                         is_tensor[i] = True
                         num_tensors += 1
                 except TypeError:
@@ -581,20 +690,23 @@ def indices_to_mask(
                     # Dealing with this fairly unusual use-case in try-except to avoid slowing down the hot path.
                     arg = int(arg)
                     if keepdim:
-                        arg = slice(arg, arg + 1)
+                        arg = slice(arg, arg + 1 if arg != -1 else None)
         mask.insert(0, arg)
 
     if num_tensors > 1:
         tensor_idx = 0
         for i in range(len(mask)):
             if is_tensor[i]:
-                # assert isinstance(arg, torch.Tensor)
+                if not isinstance(mask[i], (torch.Tensor, np.ndarray)):
+                    gs.raise_exception("Multi-dimensional masking only supported for 'to_torch=True'.")
+                # The cross-product comes of broadcasting one index per axis, which a boolean selection cannot take
+                # part in: torch reads it as consuming as many axes as it has dimensions. It becomes indices here, at
+                # the only place where combining axes makes that necessary.
+                if isinstance(mask[i], torch.Tensor) and mask[i].dtype == torch.bool:
+                    mask[i] = mask[i].nonzero()[:, 0]
                 shape = [1] * num_tensors
                 shape[tensor_idx] = -1
-                try:
-                    mask[i] = mask[i].reshape(shape)
-                except AttributeError as e:
-                    gs.raise_exception_from("Multi-dimensional masking only supported for 'to_torch=True'.", e)
+                mask[i] = mask[i].reshape(shape)
                 tensor_idx += 1
 
     return tuple(mask)
@@ -628,21 +740,6 @@ def _apply_masks(out, value, row_mask, col_mask, keepdim, copy, *, to_torch):
     else:
         mask = indices_to_mask(row_mask, col_mask, to_torch=to_torch, keepdim=keepdim, raise_if_fancy=raise_if_fancy)
     return out[mask]
-
-
-def _field_in_tree_offset_overflows_i32(value: qd.Field) -> bool:
-    """Whether the field sits past 2**31 bytes in its SNode tree.
-
-    FIXME: Quadrants' 'field_to_dlpack' truncates the in-tree byte offset to signed i32, so the zero-copy view of such
-    a field would silently alias the tree base (fixed upstream in Genesis-Embodied-AI/quadrants#768). Remove this guard
-    once the pinned quadrants release includes the fix.
-    """
-    snode = value.snode.ptr
-    offset = 0
-    while snode is not None:
-        offset += snode.offset_bytes_in_parent_cell
-        snode = snode.parent
-    return offset >= 2**31
 
 
 def qd_to_torch(
@@ -685,10 +782,8 @@ def qd_to_torch(
             is_copy = False
         except AttributeError:
             try:
-                if isinstance(value, qd.Field) and _field_in_tree_offset_overflows_i32(value):
-                    raise ValueError("Zero-copy view unavailable for fields past 2**31 bytes in their SNode tree.")
                 tc = value.to_torch(copy=False)
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError, TypeError):
                 if copy is False:
                     raise
                 tensor = _maybe_transpose(value.to_torch(), value, transpose)
@@ -755,8 +850,6 @@ def qd_to_numpy(
             is_copy = False
         except AttributeError:
             try:
-                if isinstance(value, qd.Field) and _field_in_tree_offset_overflows_i32(value):
-                    raise ValueError("Zero-copy view unavailable for fields past 2**31 bytes in their SNode tree.")
                 tc = value.to_torch(copy=False)
             except (RuntimeError, TypeError, ValueError):
                 if copy is False:
@@ -781,8 +874,10 @@ def qd_zero_grad(value) -> None:
 
     Reverse-mode accumulation in Genesis writes through `qd.atomic_add`, so adjoint buffers must start at zero between
     consecutive `loss.backward()` calls. Solvers call this from `reset_grad` to clear all owned adjoint storage without
-    enumerating fields by name. Zeroing goes through `qd_to_torch(grad, copy=False).zero_()`, a contiguous in-place
-    memset on the underlying device memory - no Quadrants kernel launch.
+    enumerating fields by name. Zeroing goes through an in-place `zero_()` on the zero-copy torch view of each grad
+    buffer, a contiguous memset on the underlying device memory. The writes are left unsynchronized so a caller can
+    batch many calls under a single flush: on Metal, call `torch.mps.synchronize()` after the batch and before the
+    next quadrants kernel reads the buffers (see set_base_links_quat).
     """
     if value is None:
         return
@@ -792,25 +887,31 @@ def qd_zero_grad(value) -> None:
             grad = value.grad
             if gs.use_zerocopy:
                 try:
-                    qd_to_torch(grad, copy=False).zero_()
+                    grad_view = qd_to_torch(grad, copy=False)
+                    grad_view.zero_()
                 except ValueError:
-                    # No zero-copy view for this buffer (e.g. a field past 2**31 bytes in its SNode tree); fill it in
-                    # place through quadrants instead.
+                    # No zero-copy view for this buffer (e.g. an interleaved AOS struct member, or a field whose
+                    # in-tree byte offset the installed torch cannot carry through DLPack); fill it in place through
+                    # quadrants instead.
                     grad.fill(0.0)
             else:
                 grad.fill(0.0)
         return
 
     cls = type(value)
-    try:
-        annotations = cls.__dict__["__annotations__"]
-    except KeyError as err:
-        raise_exception_from(
-            f"qd_zero_grad: expected `qd.Field`, `qd.Ndarray`, or a `dataclass` / `@qd.data_oriented` "
-            f"struct-of-arrays; got `{cls.__name__}`.",
-            cause=err,
-        )
-    for attr_name in annotations:
+    if dataclasses.is_dataclass(cls):
+        # The fields alone: a struct also declares its data kind as a class variable (see array_class.DataKind)
+        attr_names = [field.name for field in dataclasses.fields(cls)]
+    else:
+        try:
+            attr_names = cls.__dict__["__annotations__"]
+        except KeyError as err:
+            raise_exception_from(
+                f"qd_zero_grad: expected `qd.Field`, `qd.Ndarray`, or a `dataclass` / `@qd.data_oriented` "
+                f"struct-of-arrays; got `{cls.__name__}`.",
+                cause=err,
+            )
+    for attr_name in attr_names:
         qd_zero_grad(getattr(value, attr_name, None))
 
 
@@ -821,20 +922,41 @@ def sanitize_index(
     dim: int,
     name: str,
 ) -> torch.Tensor:
+    is_bool_mask = False
+    is_negative_wrap_required = False
     if index is None:
         index = range(max_size)
     elif isinstance(index, slice):
-        index = range(
-            index.start or 0,
-            index.stop if index.stop is not None else max_size,
-            index.step or 1,
-        )
+        index = range(*index.indices(max_size))
     elif isinstance(index, (int, np.integer)):
-        index = [index]
-    elif isinstance(index, torch.Tensor) and index.dtype == torch.bool:
-        index, *_ = torch.where(index)
+        index = (index + max_size if -max_size <= index < 0 else index,)
+    elif isinstance(index, range):
+        if index:
+            if -max_size <= index[0] < 0 and -max_size <= index[-1] < 0:
+                index = range(index.start + max_size, index.stop + max_size, index.step)
+            elif index[0] < 0 or index[-1] < 0:
+                index = tuple(index)
+                is_negative_wrap_required = True
+    elif isinstance(index, (list, tuple, torch.Tensor, np.ndarray)):
+        is_bool_mask = (isinstance(index, torch.Tensor) and index.dtype == torch.bool) or (
+            isinstance(index, np.ndarray) and np.issubdtype(index.dtype, np.bool_)
+        )
+        is_negative_wrap_required = not is_bool_mask
+    else:
+        gs.raise_exception(f"Expecting integer indices for `{name}`.")
 
-    index = torch.as_tensor(index, dtype=gs.tc_int, device=gs.device)
+    try:
+        if is_bool_mask:
+            index = torch.as_tensor(index, device=gs.device)
+        else:
+            index = torch.as_tensor(index, dtype=gs.tc_int, device=gs.device)
+    except (TypeError, ValueError, RuntimeError) as err:
+        gs.raise_exception_from(f"Expecting integer indices for `{name}`.", cause=err)
+
+    if index.dtype == torch.bool:
+        if index.ndim != 1 or len(index) != max_size:
+            gs.raise_exception(f"Boolean masks for `{name}` must have shape ({max_size},).")
+        index = torch.as_tensor(torch.where(index)[0], dtype=gs.tc_int, device=gs.device)
 
     ndim = index.ndim
     if ndim == 0:
@@ -848,6 +970,12 @@ def sanitize_index(
         gs.raise_exception(
             f"Invalid shape: {index.shape}. Expecting 1D tensor of length {expected_size} for {dim}-th index{dim_info}."
         )
+
+    if is_negative_wrap_required:
+        # Deferring the wrap until after the shared tensor conversion lets one dtype-preserving operation cover every
+        # input form that can hold negative entries
+        is_valid_negative = (-max_size <= index) & (index < 0)
+        index = torch.where(is_valid_negative, index + max_size, index)
 
     # FIXME: This check is too expensive
     # if not (0 <= dim_idx & dim_idx < size).all():
@@ -1009,6 +1137,26 @@ def assign_indexed_tensor(
 ) -> None:
     if isinstance(tensor, np.ndarray):
         value = torch.as_tensor(value)
+    # A single value written over a selection of one axis has faster forms than advanced indexing, which stages an
+    # index tensor and a scatter that dominate a write this small: the buffer is filled whole when every axis is taken
+    # whole, a boolean mask fills through the mask itself, and a selection of rows fills through the rows.
+    elif isinstance(value, (int, float)):
+        axes = [axis for axis, index in enumerate(indices) if not (isinstance(index, slice) and index == slice(None))]
+        if not axes:
+            tensor.fill_(value)
+            return
+        if len(axes) == 1:
+            axis = axes[0]
+            index = indices[axis]
+            if isinstance(index, torch.Tensor):
+                if index.dtype == torch.bool:
+                    spread = [1] * tensor.ndim
+                    spread[axis] = -1
+                    tensor.masked_fill_(index.view(spread), value)
+                    return
+                if index.ndim == 1 and index.dtype == torch.int64:
+                    tensor.index_fill_(axis, index, value)
+                    return
     try:
         tensor[indices] = value
     except (TypeError, RuntimeError):

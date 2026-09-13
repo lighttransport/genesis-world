@@ -34,7 +34,7 @@ from .utils import redirect_libc_stderr, set_random_seed, get_device
 _IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 # FIXME: qd.Field does not support zero-copy on Metal for 'torch<=2.9.1'.
 # See: https://github.com/pytorch/pytorch/pull/168193
-_TORCH_MPS_SUPPORT_DLPACK_FIELD = tuple(map(int, torch.__version__.replace("+", ".").split(".")[:3])) > (2, 9, 1)
+_TORCH_MPS_SUPPORT_DLPACK_FIELD = torch.torch_version.TorchVersion(torch.__version__.split("+", 1)[0]) > (2, 9, 1)
 if _IS_OLD_TORCH:
     warn("'torch<2.8.0' is not supported. Please upgrade pytorch manually: https://pytorch.org/get-started/locally/")
 
@@ -49,6 +49,8 @@ device: torch.device | None = None
 backend: _gs_backend | None = None
 use_ndarray: bool | None = None
 use_zerocopy: bool | None = None
+use_deterministic_algorithms: bool | None = None
+debug: bool | None = None
 EPS: float | None = None
 
 
@@ -64,6 +66,7 @@ def init(
     theme="dark",
     logger_verbose_time=False,
     performance_mode=False,
+    use_deterministic_algorithms=False,
 ):
     global _initialized
     if _initialized:
@@ -159,6 +162,11 @@ def init(
         if _use_zerocopy:
             raise_exception(f"Zero-copy not supported on {backend} backend.")
     use_zerocopy = bool(_use_zerocopy)
+
+    # Reproducing a rollout means settling the runtime-measured choices the simulation would otherwise keep revisiting
+    # (see prefer_decomposed_solver in rigid_solver.py), at the cost of the throughput they were buying, hence opt-in.
+    globals()["use_deterministic_algorithms"] = use_deterministic_algorithms
+    globals()["debug"] = debug
 
     # Define the right dtypes in accordance with selected backend and precision
     global qd_float, np_float, tc_float
@@ -263,8 +271,7 @@ def init(
             enable_fallback=False,
             # Add a (hidden) mechanism to forcible disable Quadrants debug mode as it is still a bit experimental
             debug=qd_debug and backend == _gs_backend.cpu,
-            # Forcibly disabling out of bound checks on GPU because memory usage is blowing up (x10)
-            check_out_of_bound=debug and backend == gs.cpu,  # backend != _gs_backend.metal,
+            check_out_of_bound=debug and backend != _gs_backend.metal,
             # force_scalarize_matrix=True for speeding up kernel compilation
             # FIXME: Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
             force_scalarize_matrix=True,
@@ -495,7 +502,10 @@ from .constants import (
     INACTIVE,
     integrator,
     constraint_solver,
+    friction_cone,
+    contact_resolution,
     broadphase_traversal,
+    link_ref_frame,
 )
 
 from .utils.uid import UID

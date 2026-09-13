@@ -1,16 +1,15 @@
 import io
 import itertools
 import logging
-import sys
+import math
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Sequence
-from functools import partial, cached_property
+from functools import partial
 from typing import Any, Callable, TypeVar
 
 import numpy as np
-import torch
 from PIL import Image
 
 import genesis as gs
@@ -18,12 +17,12 @@ import genesis.utils.geom as gu
 from genesis.options.recorders import (
     BasePlotterOptions,
     LinePlotterMixinOptions,
-    PyQtLinePlot as PyQtLinePlotterOptions,
-    MPLLinePlot as MPLLinePlotterOptions,
     MPLImagePlot as MPLImagePlotterOptions,
+    MPLLinePlot as MPLLinePlotterOptions,
     MPLVectorFieldPlot as MPLVectorFieldPlotterOptions,
+    PyQtLinePlot as PyQtLinePlotterOptions,
 )
-from genesis.utils import has_display, tensor_to_array
+from genesis.utils import data_to_array, has_display
 
 from .base_recorder import Recorder
 from .recorder_manager import RecorderManager, register_recording
@@ -51,17 +50,12 @@ LOGGER = logging.getLogger(__name__)
 MPL_PLOTTER_RESCALE_MIN_X = 0.5
 MPL_PLOTTER_RESCALE_RATIO_X = 0.15
 MPL_PLOTTER_RESCALE_RATIO_Y = 0.15
+MPL_PLOTTER_WINDOW_REFRESH_PERIOD = 0.1
 
 COLORS = itertools.cycle(("r", "g", "b", "c", "m", "y"))
 
 
 T = TypeVar("T")
-
-
-def _data_to_array(data: Sequence) -> np.ndarray:
-    if isinstance(data, torch.Tensor):
-        data = tensor_to_array(data)
-    return np.atleast_1d(data)
 
 
 class BasePlotter(Recorder):
@@ -77,22 +71,9 @@ class BasePlotter(Recorder):
 
         self.video_writer = None
         if self._options.save_to_filename:
-
-            def _get_video_frame_buffer(plotter):
-                # Wait for the plotter to produce a frame. When the plotter runs in a background thread,
-                # it may have already dequeued data but not yet appended the rendered frame to the buffer.
-                # When not threaded, frames are produced synchronously before this call, so an empty
-                # buffer means something went wrong — the None check handles that case too.
-                while not plotter._frames_buffer:
-                    if plotter._processor_thread is None or not plotter._processor_thread.is_alive():
-                        gs.raise_exception(
-                            f"[{type(plotter).__name__}] No frame available and plotter thread is not running."
-                        )
-                    time.sleep(0.01)
-                return plotter._frames_buffer.pop(0)
-
+            # The plotter renders its frame on the stepping thread before the writer samples it, so one is there
             self.video_writer = self._manager.add_recorder(
-                data_func=partial(_get_video_frame_buffer, self),
+                data_func=partial(self._frames_buffer.pop, 0),
                 rec_options=gs.recorders.VideoFile(
                     filename=self._options.save_to_filename,
                     hz=self._options.hz,
@@ -159,7 +140,7 @@ class LinePlotHelper:
                 )
 
                 for key in data.keys():
-                    data_values = _data_to_array(data[key])
+                    data_values = np.atleast_1d(data[key])
                     label_values = options.labels[key]
                     assert len(label_values) == len(data_values), (
                         f"[{type(self).__name__}] Label count must match data count for key '{key}'"
@@ -168,11 +149,11 @@ class LinePlotHelper:
             else:
                 self._subplot_structure = {}
                 for key, values in data.items():
-                    values = _data_to_array(values)
+                    values = np.atleast_1d(values)
                     self._subplot_structure[key] = tuple(f"{key}_{i}" for i in range(len(values)))
         else:
             self._is_dict_data = False
-            data = _data_to_array(data)
+            data = np.atleast_1d(data)
 
             if options.labels is not None:
                 labels = options.labels if isinstance(options.labels, Sequence) else (options.labels,)
@@ -195,10 +176,10 @@ class LinePlotHelper:
             for key, values in data.items():
                 if key not in self._subplot_structure:
                     continue  # skip keys not included in subplot structure
-                values = _data_to_array(values)
+                values = np.atleast_1d(values)
                 processed_data[key] = values
         else:
-            data = _data_to_array(data)
+            data = np.atleast_1d(data)
             processed_data = {"main": data}
 
         # Update time data
@@ -287,6 +268,7 @@ class BasePyQtPlotter(BasePlotter):
 
     @property
     def run_in_thread(self) -> bool:
+        # Qt widgets are driven from the thread that owns the application, which is the stepping thread here
         return False
 
     def get_image_array(self):
@@ -311,7 +293,7 @@ class PyQtLinePlotter(BasePyQtPlotter):
     def build(self):
         super().build()
 
-        self.line_plot = LinePlotHelper(options=self._options, data=self._data_func())
+        self.line_plot = LinePlotHelper(options=self._options, data=data_to_array(self._data_func()))
         self.curves: dict[str, list[pg.PlotCurveItem]] = {}
 
         # create plots for each subplot
@@ -380,16 +362,63 @@ class BaseMPLPlotter(BasePlotter):
         import matplotlib.pyplot as plt
 
         self.fig: plt.Figure | None = None
-        self._lock = threading.Lock()
+        self.axes: list[plt.Axes] = []
+        self._background: Any = None
+        self.window_refresh_time = -math.inf
 
         # matplotlib figsize uses inches
         dpi = mpl.rcParams.get("figure.dpi", 100)
         self.figsize = (self._options.window_size[0] / dpi, self._options.window_size[1] / dpi)
 
+    def _make_subplot_grid(self, n_subplots: int, titles: "Sequence[str] | None" = None) -> "list":
+        """
+        Create ``self.fig`` with ``n_subplots`` axes in a near-square grid and return them as a flat list (one figure,
+        many subplots).
+
+        Unused cells in the grid are hidden, the figure title is set from ``options.title``, and each axis gets the
+        matching entry of ``titles`` when provided. Subclasses fill the returned axes and then call
+        ``_cache_background()``.
+        """
+        import matplotlib.pyplot as plt
+
+        n_rows = max(1, int(np.floor(np.sqrt(n_subplots))))
+        n_cols = int(np.ceil(n_subplots / n_rows))
+        self.fig, axes = plt.subplots(n_rows, n_cols, figsize=self.figsize, squeeze=False, constrained_layout=True)
+        axes = list(axes.ravel())
+        for ax in axes[n_subplots:]:
+            ax.set_visible(False)
+        self.axes = axes[:n_subplots]
+        if titles is not None:
+            for ax, title in zip(self.axes, titles):
+                ax.set_title(title)
+        self.fig.suptitle(self._options.title)
+        return self.axes
+
+    def _cache_background(self):
+        """Draw the figure and cache its full background region for fast blitting."""
+        self.fig.canvas.draw()
+        self._background = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+
+    def on_resize(self, event=None):
+        """Re-cache the blit background after a resize."""
+        if self.fig is not None and self.axes:
+            self._cache_background()
+
     def _show_fig(self):
         if self._options.show_window:
             self.fig.show()
             gs.logger.info(f"[{type(self).__name__}] created matplotlib window")
+
+    def flush_events(self):
+        """Repaint the plot window with the latest drawing, at most once per MPL_PLOTTER_WINDOW_REFRESH_PERIOD."""
+        # Repainting the window costs about as much as drawing the figure, while the samples arrive at the simulation
+        # rate, which may run far ahead of real time. The drawing stays in the canvas, so a skipped repaint is caught
+        # up by the next one.
+        now = time.perf_counter()
+        if now - self.window_refresh_time < MPL_PLOTTER_WINDOW_REFRESH_PERIOD:
+            return
+        self.fig.canvas.flush_events()
+        self.window_refresh_time = now
 
     def cleanup(self):
         """Clean up matplotlib resources."""
@@ -422,20 +451,21 @@ class BaseMPLPlotter(BasePlotter):
         """
         from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-        self._lock.acquire()
         if isinstance(self.fig.canvas, FigureCanvasAgg):
             # Read internal buffer
             width, height = self.fig.canvas.get_width_height(physical=True)
-            rgba_array_flat = np.frombuffer(self.fig.canvas.buffer_rgba(), dtype=np.uint8)
-            rgb_array = rgba_array_flat.reshape((height, width, 4))[..., :3]
+            # The alpha channel is read as padding, so that the resampling below skips premultiplying it.
+            img = Image.frombuffer("RGBX", (width, height), self.fig.canvas.buffer_rgba())
 
-            # Rescale image if necessary
-            if (width, height) != tuple(self._options.window_size):
-                img = Image.fromarray(rgb_array)
-                img = img.resize(self._options.window_size, resample=Image.BILINEAR)
-                rgb_array = np.asarray(img)
-            else:
-                rgb_array = rgb_array.copy()
+            # Rescale image if necessary. A high-DPI canvas holds a whole multiple of the window size along each axis,
+            # which PIL reduces much faster than it resamples to an arbitrary size.
+            window_width, window_height = self._options.window_size
+            if (width, height) != (window_width, window_height):
+                if width % window_width == 0 and height % window_height == 0:
+                    img = img.reduce((width // window_width, height // window_height))
+                else:
+                    img = img.resize((window_width, window_height), resample=Image.BOX)
+            rgb_array = np.asarray(img.convert("RGB"))
         else:
             # Slower but more generic fallback only if necessary
             buffer = io.BytesIO()
@@ -443,22 +473,14 @@ class BaseMPLPlotter(BasePlotter):
             buffer.seek(0)
             img = Image.open(buffer)
             rgb_array = np.asarray(img.convert("RGB"))
-        self._lock.release()
 
         return rgb_array
 
-    @cached_property
+    @property
     def run_in_thread(self) -> bool:
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-        if sys.platform == "darwin":
-            return False
-        if self._is_built:
-            assert self.fig is not None
-            # All Agg-based backends derives from the surfaceless Agg backend, so 'isinstance' cannot be used to
-            # discriminate the latter from others.
-            return type(self.fig.canvas) is FigureCanvasAgg
-        return not self._options.show_window
+        # Drawing is Python code, so it cannot overlap the stepping thread's hold on the interpreter lock: a worker
+        # thread only adds the per-sample queue transfer and the switching between threads, which slows stepping down.
+        return False
 
 
 @register_recording(MPLLinePlotterOptions)
@@ -466,7 +488,7 @@ class MPLLinePlotter(BaseMPLPlotter):
     def build(self):
         super().build()
 
-        self.line_plot = LinePlotHelper(options=self._options, data=self._data_func())
+        self.line_plot = LinePlotHelper(options=self._options, data=data_to_array(self._data_func()))
 
         import matplotlib.pyplot as plt
 
@@ -474,6 +496,7 @@ class MPLLinePlotter(BaseMPLPlotter):
         self.lines: dict[str, list[plt.Line2D]] = {}
         self.caches_bbox: list[Any] = []
         self.cache_xmax: float = -1
+        self.x_max_plot: float = -1
 
         # Create figure and subplots
         n_subplots = len(self.line_plot.subplot_structure)
@@ -517,8 +540,6 @@ class MPLLinePlotter(BaseMPLPlotter):
         super().process(data, cur_time)
 
     def _update_plot(self):
-        self._lock.acquire()
-
         # Update limits for each subplot if necessary
         limits_changed = False
         if len(self.line_plot.x_data) > 1:
@@ -536,16 +557,17 @@ class MPLLinePlotter(BaseMPLPlotter):
                         must_update_limit_y = True
                 subplots_ylim_data.append(subplot_ylim_data)
 
-            # Next, adjust the limits on x-axis if they must be extended or adjusting y-axis is already planned
+            # Next, adjust the limits on x-axis if they must be extended or adjusting y-axis is already planned. The
+            # upper limit is kept as set here, since the axis reports it padded and a comparison against the padded
+            # value would call for a rescale on every sample.
             x_limits_changed = False
-            x_min_plot, x_max_plot = ax.get_xlim()
             x_min_data, x_max_data = self.line_plot.x_data[0], self.line_plot.x_data[-1]
-            if must_update_limit_y or x_min_plot < 0.0 or x_max_plot < x_max_data:
+            if must_update_limit_y or self.x_max_plot < x_max_data:
                 x_min_plot = max(0.0, x_min_data)
-                x_max_plot = x_max_data + max(
+                self.x_max_plot = x_max_data + max(
                     MPL_PLOTTER_RESCALE_RATIO_X * (x_max_data - x_min_data), MPL_PLOTTER_RESCALE_MIN_X
                 )
-                ax.set_xlim((x_min_plot - gs.EPS, x_max_plot + gs.EPS))
+                ax.set_xlim((x_min_plot - gs.EPS, self.x_max_plot + gs.EPS))
                 x_limits_changed = True
 
             # Finally, adjust the limits on y-axis if either x- or y-axis must be extended
@@ -582,8 +604,7 @@ class MPLLinePlotter(BaseMPLPlotter):
             # Blit the updated subplot
             self.fig.canvas.blit(ax.bbox)
 
-        self.fig.canvas.flush_events()
-        self._lock.release()
+        self.flush_events()
 
     def cleanup(self):
         super().cleanup()
@@ -591,6 +612,7 @@ class MPLLinePlotter(BaseMPLPlotter):
         self.lines.clear()
         self.caches_bbox.clear()
         self.cache_xmax = -1
+        self.x_max_plot = -1
 
 
 @register_recording(MPLImagePlotterOptions)
@@ -618,10 +640,7 @@ class MPLImagePlotter(BaseMPLPlotter):
 
     def process(self, data, cur_time):
         """Process new image data and update display."""
-        if isinstance(data, torch.Tensor):
-            img_data = tensor_to_array(data)
-        else:
-            img_data = np.asarray(data)
+        img_data = np.asarray(data)
 
         vmin, vmax = np.min(img_data), np.max(img_data)
 
@@ -636,7 +655,7 @@ class MPLImagePlotter(BaseMPLPlotter):
         self.ax.draw_artist(self.image_plot)
         self.fig.canvas.blit(self.ax.bbox)
 
-        self.fig.canvas.flush_events()
+        self.flush_events()
 
     def cleanup(self):
         super().cleanup()
@@ -657,13 +676,20 @@ class MPLVectorFieldPlotter(BaseMPLPlotter):
     """
     Live 3D vector field viewer: projects positions and vectors onto a 2D plane and plots arrows colored by magnitude.
 
-    The data_func should return an array of shape (N, 3) with the 3D vector at each position given in options.
+    The data_func returns an array of shape (N, 3) with the 3D vector at each position. When ``subplot_titles`` is
+    set (K titles), the figure holds K subplots sharing the same positions, and the data_func instead returns shape
+    (K, N, 3) -- one vector field per subplot (e.g. one per environment).
+
+    When ``twist_scale_factor`` is set, a curved rotation arrow is overlaid at each position for the twist about the
+    view normal (the ``twist_vectors . normal`` component), and the data_func instead returns a pair
+    ``(vectors, twist_vectors)`` with each entry shaped as above. Positive twist (right-hand rule about ``normal``)
+    sweeps counter-clockwise; the arc is colored by signed twist on a diverging colorbar centered at zero.
     """
 
     def build(self):
         super().build()
 
-        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
 
         opts = self._options
         positions = np.array(opts.positions, dtype=float)
@@ -679,90 +705,152 @@ class MPLVectorFieldPlotter(BaseMPLPlotter):
         (x_min, y_min), (x_max, y_max) = xy.min(axis=0), xy.max(axis=0)
         margin = 0.1 * max(np.max(np.ptp(xy, axis=0)), gs.EPS)
 
-        self.fig, self.ax = plt.subplots(figsize=self.figsize)
-        self.fig.suptitle(opts.title)
-        self.ax.set_xlim(x_min - margin, x_max + margin)
-        self.ax.set_ylim(y_min - margin, y_max + margin)
-        self.ax.set_aspect("equal")
-        self.ax.set_axis_off()
+        titles = opts.subplot_titles
+        axes = self._make_subplot_grid(len(titles) if titles else 1, titles)
 
         self._positions = positions
         self._normal = normal
         self._scale_factor = opts.scale_factor
         self._max_magnitude = opts.max_magnitude
+        self._twist_scale_factor = opts.twist_scale_factor
+        self._twist_max_magnitude = opts.twist_max_magnitude
+        self._scatters = []
+        self._quivers = []
+        self._twist_arcs = []
+        self._twist_heads = []
         n = len(xy)
-        self._scatter = self.ax.scatter(
-            xy[:, 0],
-            xy[:, 1],
-            s=8,
-            c=np.zeros(n),
-            cmap="plasma",
-            vmin=0,
-            vmax=self._max_magnitude,
-            zorder=0,
-        )
-        self._quiver = self.ax.quiver(
-            xy[:, 0],
-            xy[:, 1],
-            np.zeros_like(xy[:, 0]),
-            np.zeros_like(xy[:, 1]),
-            np.zeros(len(xy)),
-            cmap="plasma",
-            clim=(0, self._max_magnitude),
-            zorder=1,
-            scale_units="xy",
-            scale=1,
-        )
-        self.fig.colorbar(self._quiver, ax=self.ax, label="Magnitude")
-        self.fig.canvas.draw()
-        self._background = self.fig.canvas.copy_from_bbox(self.ax.bbox)
+
+        # Sign that maps positive twist (right-hand rule about normal) to a counter-clockwise sweep in the projected
+        # basis, independent of the handedness of the orthogonals() basis.
+        u, v = gu.orthogonals(normal)
+        self._twist_sign = 1.0 if np.dot(np.cross(u, v), normal) > 0.0 else -1.0
+
+        for ax in axes:
+            ax.set_xlim(x_min - margin, x_max + margin)
+            ax.set_ylim(y_min - margin, y_max + margin)
+            ax.set_aspect("equal")
+            ax.set_axis_off()
+            self._scatters.append(
+                ax.scatter(
+                    xy[:, 0], xy[:, 1], s=8, c=np.zeros(n), cmap="plasma", vmin=0, vmax=self._max_magnitude, zorder=0
+                )
+            )
+            self._quivers.append(
+                ax.quiver(
+                    xy[:, 0],
+                    xy[:, 1],
+                    np.zeros(n),
+                    np.zeros(n),
+                    np.zeros(n),
+                    cmap="plasma",
+                    clim=(0, self._max_magnitude),
+                    zorder=1,
+                    scale_units="xy",
+                    scale=1,
+                    pivot="mid" if self._twist_scale_factor is not None else "tail",
+                )
+            )
+            if self._twist_scale_factor is not None:
+                arcs = LineCollection([], cmap="coolwarm", zorder=2)
+                arcs.set_clim(-self._twist_max_magnitude, self._twist_max_magnitude)
+                arcs.set_array(np.zeros(n))
+                ax.add_collection(arcs)
+                self._twist_arcs.append(arcs)
+                self._twist_heads.append(
+                    ax.quiver(
+                        xy[:, 0],
+                        xy[:, 1],
+                        np.zeros(n),
+                        np.zeros(n),
+                        np.zeros(n),
+                        cmap="coolwarm",
+                        clim=(-self._twist_max_magnitude, self._twist_max_magnitude),
+                        zorder=3,
+                        scale_units="xy",
+                        scale=1,
+                    )
+                )
+            for artist in (self._scatters[-1], self._quivers[-1], *self._twist_arcs[-1:], *self._twist_heads[-1:]):
+                artist.set_clip_box(ax.bbox)
+                artist.set_clip_on(True)
+            # The zero-length twist-head quiver renders as a dot per taxel; animate it (and the arcs) so it is not
+            # baked into the cached background and left ghosting behind the live scatter.
+            for artist in (*self._twist_arcs[-1:], *self._twist_heads[-1:]):
+                artist.set_animated(True)
+        self.fig.colorbar(self._quivers[-1], ax=axes, label="Magnitude")
+        if self._twist_scale_factor is not None:
+            self.fig.colorbar(self._twist_arcs[-1], ax=axes, label="Twist")
+        self._cache_background()
         self._show_fig()
 
         self.fig.canvas.mpl_connect("resize_event", self.on_resize)
 
-    def on_resize(self, event):
-        self._lock.acquire()
-        try:
-            if self.fig is not None and self.ax is not None:
-                self.fig.canvas.draw()
-                self._background = self.fig.canvas.copy_from_bbox(self.ax.bbox)
-        finally:
-            self._lock.release()
-
     def process(self, data, cur_time):
-        """Process new vector data and update the quiver plot."""
-        if isinstance(data, torch.Tensor):
-            vectors = tensor_to_array(data)
-        else:
-            vectors = np.asarray(data, dtype=float)
-        if vectors.ndim != 2 or vectors.shape[1] != 3:
+        """Process new vector data and update each subplot's quiver (and the twist overlay when enabled)."""
+        is_twist = self._twist_scale_factor is not None
+        vectors_data, twist_data = data if is_twist else (data, None)
+        # Promote a bare (N, 3) field to a single-subplot (K, N, 3) stack.
+        vectors_all = np.asarray(vectors_data)
+        if vectors_all.ndim == 2:
+            vectors_all = vectors_all[None]
+        twist_all = None
+        if is_twist:
+            twist_all = np.asarray(twist_data)
+            if twist_all.ndim == 2:
+                twist_all = twist_all[None]
+
+        n = len(self._positions)
+        if vectors_all.ndim != 3 or vectors_all.shape[1:] != (n, 3):
             return
-        if vectors.shape[0] != len(self._positions):
+        if vectors_all.shape[0] != len(self.axes) or self._background is None:
+            return
+        if is_twist and twist_all.shape != vectors_all.shape:
             return
 
-        magnitudes = np.linalg.norm(vectors, axis=-1)
-        xy, uv = _project_to_plane(self._normal, self._positions, vectors)
-
-        if self._background is not None:
-            self._lock.acquire()
-            self._scatter.set_offsets(xy)
-            self._scatter.set_array(magnitudes)
-            self._quiver.set_offsets(xy)
-            self._quiver.set_UVC(*(uv * self._scale_factor).T)
-            self._quiver.set_array(magnitudes)
-            self.fig.canvas.restore_region(self._background)
-            self.ax.draw_artist(self._scatter)
-            self.ax.draw_artist(self._quiver)
-            self.fig.canvas.blit(self.ax.bbox)
-            self.fig.canvas.flush_events()
-            self._lock.release()
+        # Blit the whole figure, not per-axes: a stroke clipped at an axes box can bleed a pixel past it, and a
+        # per-axes blit never restores that sliver, so it would accumulate as residue.
+        self.fig.canvas.restore_region(self._background)
+        for i_ax, (ax, scatter, quiver, vectors) in enumerate(
+            zip(self.axes, self._scatters, self._quivers, vectors_all)
+        ):
+            magnitudes = np.linalg.norm(vectors, axis=-1)
+            xy, uv = _project_to_plane(self._normal, self._positions, vectors)
+            scatter.set_offsets(xy)
+            scatter.set_array(magnitudes)
+            quiver.set_offsets(xy)
+            quiver.set_UVC(*(uv * self._scale_factor).T)
+            quiver.set_array(magnitudes)
+            ax.draw_artist(scatter)
+            ax.draw_artist(quiver)
+            if is_twist:
+                arcs, heads = self._twist_arcs[i_ax], self._twist_heads[i_ax]
+                twist = twist_all[i_ax] @ self._normal
+                radius = self._twist_scale_factor * np.abs(twist)
+                direction = self._twist_sign * np.sign(twist)
+                # 270-degree arc per taxel; the open quarter marks the rotation and leaves room for the head.
+                ang = direction[:, None] * np.linspace(0.0, 1.5 * np.pi, 16)[None, :]
+                xs = xy[:, 0][:, None] + radius[:, None] * np.cos(ang)
+                ys = xy[:, 1][:, None] + radius[:, None] * np.sin(ang)
+                segments = np.stack((xs, ys), axis=-1)
+                arcs.set_segments(list(segments))
+                arcs.set_array(twist)
+                heads.set_offsets(segments[:, -2])
+                heads.set_UVC(segments[:, -1, 0] - segments[:, -2, 0], segments[:, -1, 1] - segments[:, -2, 1], twist)
+                ax.draw_artist(arcs)
+                ax.draw_artist(heads)
+        self.fig.canvas.blit(self.fig.bbox)
+        self.flush_events()
 
     def cleanup(self):
         super().cleanup()
-        self._scatter = None
-        self._quiver = None
+        self._scatters = None
+        self._quivers = None
+        self._twist_arcs = None
+        self._twist_heads = None
         self._positions = None
         self._normal = None
         self._scale_factor = None
         self._max_magnitude = None
-        self._background = None
+        self._twist_scale_factor = None
+        self._twist_max_magnitude = None
+        self._twist_sign = None

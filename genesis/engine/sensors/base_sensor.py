@@ -177,7 +177,7 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
     _options_cls: ClassVar[type]
     _metadata_cls: ClassVar[type]
-    _return_data_class: ClassVar[type] = tuple
+    _return_data_cls: ClassVar[type] = tuple
     # Cross-type shared context class declared as the second ``Sensor[...]`` parameter; ``NoneType`` (declared as
     # ``None``) means this sensor type consumes no shared context.
     _shared_context_cls: ClassVar[type] = type(None)
@@ -200,7 +200,7 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
                 if len(args) >= 3 and not isinstance(args[2], TypeVar):
                     cls._metadata_cls = args[2]
                 if len(args) >= 4 and not isinstance(args[3], TypeVar):
-                    cls._return_data_class = args[3]
+                    cls._return_data_cls = args[3]
                 break
         # Strict contract: overriding `_post_process` requires overriding `_get_intermediate_format` and/or
         # `_get_intermediate_dtype`. The intermediate buffer must be a distinct buffer regardless of whether its
@@ -286,7 +286,8 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
         else:
             self._return_shapes = intrinsic_shapes
 
-        self._cache_idx: int = -1  # initialized by SensorManager during build
+        # Element offset within the per-class cache; initialized by SensorManager during build
+        self._cache_offset: int = -1
 
     # =============================== methods to implement ===============================
 
@@ -493,7 +494,7 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
         Automatically read and process sensor data. See RecorderOptions for more details.
 
         Data from `sensor.read()` is used. If the sensor data needs to be preprocessed before passing to the recorder,
-        consider using `scene.start_recording()` instead with a custom data function.
+        consider using `scene.add_recorder()` instead with a custom data function.
 
         Parameters
         ----------
@@ -528,20 +529,20 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
         if len(return_values) == 1:
             return return_values[0]
-        return self._return_data_class(*return_values)
+        return self._return_data_cls(*return_values)
 
     def _sanitize_envs_idx(self, envs_idx) -> torch.Tensor:
         return self._manager._sim._scene._sanitize_envs_idx(envs_idx)
 
-    def _set_metadata_field(self, value, field, field_size, envs_idx=None):
+    def _set_metadata_field(self, value, field, field_start, field_size, envs_idx=None):
         envs_idx = self._sanitize_envs_idx(envs_idx)
         if field.ndim == 2:
-            # flat field structure
-            idx = self._idx * field_size
-            index_slice = slice(idx, idx + field_size)
+            # Flat field structure: per-sensor spans may differ in size (e.g. cache-sized imperfection fields), so the
+            # caller provides this sensor's start rather than a uniform stride.
+            index_slice = slice(field_start, field_start + field_size)
         else:
             # per sensor field structure
-            index_slice = self._idx
+            index_slice = field_start
 
         field[:, index_slice] = broadcast_tensor(value, field.dtype, (len(envs_idx), field_size), ("envs_idx", ""))
 
@@ -626,11 +627,11 @@ class _LinkAttachedSensorMixin:
 
     @gs.assert_built
     def set_pos_offset(self, pos_offset, envs_idx=None):
-        self._set_metadata_field(pos_offset, self._shared_metadata.offsets_pos, 3, envs_idx)
+        self._set_metadata_field(pos_offset, self._shared_metadata.offsets_pos, self._idx, 3, envs_idx)
 
     @gs.assert_built
     def set_quat_offset(self, quat_offset, envs_idx=None):
-        self._set_metadata_field(quat_offset, self._shared_metadata.offsets_quat, 4, envs_idx)
+        self._set_metadata_field(quat_offset, self._shared_metadata.offsets_quat, self._idx, 4, envs_idx)
 
 
 class RigidSensorMixin(_LinkAttachedSensorMixin, Generic[RigidSensorMetadataMixinT]):
@@ -708,22 +709,26 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
     @gs.assert_built
     def set_resolution(self, resolution, envs_idx=None):
-        self._set_metadata_field(resolution, self._shared_metadata.resolution, self._cache_size, envs_idx)
+        self._set_metadata_field(
+            resolution, self._shared_metadata.resolution, self._cache_offset, self._cache_size, envs_idx
+        )
         self._shared_metadata.has_any_resolution = bool((self._shared_metadata.resolution > gs.EPS).any().item())
 
     @gs.assert_built
     def set_bias(self, bias, envs_idx=None):
-        self._set_metadata_field(bias, self._shared_metadata.bias, self._cache_size, envs_idx)
+        self._set_metadata_field(bias, self._shared_metadata.bias, self._cache_offset, self._cache_size, envs_idx)
         self._shared_metadata.has_any_bias = bool((self._shared_metadata.bias != 0).any().item())
 
     @gs.assert_built
     def set_random_walk(self, random_walk, envs_idx=None):
-        self._set_metadata_field(random_walk, self._shared_metadata.random_walk, self._cache_size, envs_idx)
+        self._set_metadata_field(
+            random_walk, self._shared_metadata.random_walk, self._cache_offset, self._cache_size, envs_idx
+        )
         self._shared_metadata.has_any_random_walk = bool((self._shared_metadata.random_walk > gs.EPS).any().item())
 
     @gs.assert_built
     def set_noise(self, noise, envs_idx=None):
-        self._set_metadata_field(noise, self._shared_metadata.noise, self._cache_size, envs_idx)
+        self._set_metadata_field(noise, self._shared_metadata.noise, self._cache_offset, self._cache_size, envs_idx)
         self._shared_metadata.has_any_noise = bool((self._shared_metadata.noise > gs.EPS).any().item())
 
     @gs.assert_built
@@ -736,7 +741,14 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
                 f"Sensor jitter must not exceed the simulation step dt={self._dt}; got "
                 f"jitter={tuple(jitter_np.ravel())}."
             )
-        self._set_metadata_field(jitter_np / self._dt, self._shared_metadata.jitter_ts, 1, envs_idx)
+        # Same bound as `SensorOptions.model_post_init`, enforced here because only a sensor declaring a delay at build
+        # time gets the ring slot a jittered read reaches (see `cls_delay_depth` in sensor_manager.py).
+        if np.any(jitter_np > self._options.delay):
+            gs.raise_exception(
+                f"Sensor jitter must not exceed the read delay={self._options.delay}; got "
+                f"jitter={tuple(jitter_np.ravel())}."
+            )
+        self._set_metadata_field(jitter_np / self._dt, self._shared_metadata.jitter_ts, self._idx, 1, envs_idx)
         # Recompute the slow-path flag from the freshly-written class metadata. One GPU->CPU sync at setter call time;
         # setters are not hot path. The check covers partial envs_idx writes and other sensors.
         self._shared_metadata.has_any_jitter = bool((self._shared_metadata.jitter_ts > gs.EPS).any().item())
@@ -753,10 +765,9 @@ class SimpleSensor(Sensor[OptionsT, SharedSensorContextT, SharedSensorMetadataT,
 
         batch_size = self._manager._sim._B
 
-        # Jitter must not exceed the simulation step so a single jittered read can only shift by at most one extra ring
-        # slot. The per-class return-space ring is sized at build to accommodate `max_delay + 1` slots; a larger jitter
-        # would wrap modulo the ring depth and silently return wrong-frame data. An EPS slack lets `jitter == dt` pass
-        # cleanly despite float quantization.
+        # Jitter must not exceed the step, so a read shifts by at most one extra ring slot - the margin the return-space
+        # ring is sized for (see `cls_delay_depth` in sensor_manager.py). An EPS slack lets `jitter == dt` pass cleanly
+        # despite float quantization.
         jitter_np = np.asarray(self._options.jitter, dtype=gs.np_float)
         if np.any(jitter_np >= self._dt + gs.EPS):
             gs.raise_exception(

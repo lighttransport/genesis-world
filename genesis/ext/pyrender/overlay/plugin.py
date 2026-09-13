@@ -204,14 +204,9 @@ class ImGuiOverlayPlugin(ViewerPlugin):
 
         Caller must hold the render lock. Covers both the rigid and kinematic solvers, since both manage
         KinematicEntity-based entities the browser can pose."""
-        rigid_solver = self.scene.rigid_solver
-        # Collision-geom transforms only exist on the rigid solver; visual-geom transforms apply to both.
-        if rigid_solver.is_active:
-            rigid_solver.update_geoms_render_T()
-        for solver in (rigid_solver, self.scene.kinematic_solver):
+        for solver in (self.scene.rigid_solver, self.scene.kinematic_solver):
             if solver.is_active:
                 solver.update_vgeoms()
-                solver.update_vgeoms_render_T()
         ctx = self.viewer.gs_context
         ctx.update_link_frame()
         ctx.update_rigid()
@@ -220,8 +215,6 @@ class ImGuiOverlayPlugin(ViewerPlugin):
         """Switch the entity's rendered mesh between ``"visual"`` and ``"collision"``. Removes the previous
         render nodes from the context, swaps ``entity.surface.vis_mode``, then rebuilds nodes from the
         appropriate geom set."""
-        from genesis.ext import pyrender
-
         if not isinstance(entity.surface, gs.surfaces.Surface):
             return
         old_mode = entity.surface.vis_mode
@@ -234,32 +227,16 @@ class ImGuiOverlayPlugin(ViewerPlugin):
 
             old_geoms = entity.vgeoms if old_mode == "visual" else entity.geoms
             for geom in old_geoms:
-                if geom.uid in ctx.rigid_nodes:
-                    ctx.remove_node(ctx.rigid_nodes[geom.uid])
-                    del ctx.rigid_nodes[geom.uid]
+                ctx.remove_rigid_node(geom)
 
             entity.surface.vis_mode = mode
             self._refresh_visuals()
 
-            is_collision = mode == "collision"
-            geoms, geoms_T = (
-                (entity.vgeoms, solver._vgeoms_render_T) if mode == "visual" else (entity.geoms, solver._geoms_render_T)
-            )
+            is_visual = mode == "visual"
+            geoms = entity.vgeoms if is_visual else entity.geoms
+            geoms_T = ctx.rigid_geoms_T(solver, is_visual)
             for geom in geoms:
-                geom_envs_idx = ctx._get_geom_active_envs_idx(geom, ctx.rendered_envs_idx)
-                if len(geom_envs_idx) == 0:
-                    continue
-                ctx.add_rigid_node(
-                    geom,
-                    pyrender.Mesh.from_trimesh(
-                        mesh=geom.get_trimesh(),
-                        poses=geoms_T[geom.idx][geom_envs_idx],
-                        smooth=geom.surface.smooth if not is_collision else False,
-                        double_sided=geom.surface.double_sided if not is_collision else False,
-                        is_floor=isinstance(entity._morph, gs.morphs.Plane),
-                        env_shared=not ctx.env_separate_rigid,
-                    ),
-                )
+                ctx.add_geom_node(geom, geoms_T)
 
     def _init_imgui(self):
         """Initialize ImGui. Must be called from the viewer thread (e.g., in on_draw)."""
@@ -413,8 +390,9 @@ class ImGuiOverlayPlugin(ViewerPlugin):
 
     def on_mouse_scroll(self, x, y, dx, dy) -> EVENT_HANDLE_STATE:
         if self._available:
-            # imgui backend expects: on_mouse_scroll(x, y, mods, scroll)
-            self._impl.on_mouse_scroll(x, y, 0, dy)
+            # Pyglet's deltas already reflect the system's scrolling preference. Forward them directly because the
+            # imgui-bundle Pyglet backend negates the vertical delta, which reverses the configured direction.
+            self._io.add_mouse_wheel_event(dx, dy)
         return EVENT_HANDLED if self._is_capturing() else None
 
     def on_mouse_motion(self, x, y, dx, dy) -> EVENT_HANDLE_STATE:
@@ -562,8 +540,8 @@ class ImGuiOverlayPlugin(ViewerPlugin):
             imgui.pop_style_color(3)
 
         # Time display (frame count * dt = simulation time)
-        sim_time = self.scene.t * self.scene.sim.dt
-        imgui.text(f"Time: {sim_time:.3f}s  Step: {self.scene.t}")
+        step = self.scene.sim.cur_step_global
+        imgui.text(f"Time: {step * self.scene.sim.dt:.3f}s  Step: {step}")
 
         # FPS display
         if self._fps_history:

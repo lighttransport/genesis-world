@@ -3,24 +3,21 @@ import numpy as np
 import genesis as gs
 import genesis.utils.geom as gu
 
-########################## init ##########################
-gs.init(precision="32", logging_level="info")
+gs.init(backend=gs.cpu, precision="32", logging_level="info")
 
-########################## create a scene ##########################
 scene = gs.Scene(
+    rigid_options=gs.options.RigidOptions(
+        enable_collision=False,
+        enable_joint_limit=False,
+    ),
     viewer_options=gs.options.ViewerOptions(
         camera_pos=(2.0, -2, 1.5),
         camera_lookat=(0.0, 0.0, 0.0),
         camera_fov=40,
     ),
-    rigid_options=gs.options.RigidOptions(
-        enable_joint_limit=False,
-        enable_collision=False,
-    ),
     show_viewer=True,
 )
 
-########################## entities ##########################
 
 scene.add_entity(
     gs.morphs.Plane(),
@@ -29,7 +26,6 @@ robot = scene.add_entity(
     gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"),
 )
 
-########################## build ##########################
 scene.build()
 
 # debug frames for IK target visualization

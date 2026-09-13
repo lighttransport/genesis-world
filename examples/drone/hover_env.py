@@ -37,28 +37,29 @@ class HoverEnv:
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
 
-        # create scene
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
+            sim_options=gs.options.SimOptions(
+                dt=self.dt,
+            ),
+            rigid_options=gs.options.RigidOptions(
+                dt=self.dt / 2,
+                enable_collision=True,
+                enable_joint_limit=True,
+                constraint_solver=gs.constraint_solver.Newton,
+            ),
+            vis_options=gs.options.VisOptions(
+                rendered_envs_idx=list(range(self.rendered_env_num)),
+            ),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(3.0, 0.0, 3.0),
                 camera_lookat=(0.0, 0.0, 1.0),
                 camera_fov=40,
             ),
-            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),
-            rigid_options=gs.options.RigidOptions(
-                dt=self.dt,
-                constraint_solver=gs.constraint_solver.Newton,
-                enable_collision=True,
-                enable_joint_limit=True,
-            ),
             show_viewer=show_viewer,
         )
 
-        # add plane
         self.scene.add_entity(gs.morphs.Plane())
 
-        # add target
         if self.env_cfg["visualize_target"]:
             self.target = self.scene.add_entity(
                 morph=gs.morphs.Mesh(
@@ -76,7 +77,6 @@ class HoverEnv:
         else:
             self.target = None
 
-        # add camera
         if self.env_cfg["visualize_camera"]:
             self.cam = self.scene.add_camera(
                 res=(640, 480),
@@ -90,9 +90,12 @@ class HoverEnv:
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
-        self.drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
+        self.drone = self.scene.add_entity(
+            morph=gs.morphs.Drone(
+                file="urdf/drones/cf2x.urdf",
+            )
+        )
 
-        # build scene
         self.scene.build(n_envs=num_envs)
 
         # prepare reward functions and multiply reward scales by dt
@@ -245,7 +248,7 @@ class HoverEnv:
         self._update_observation()
         return self.get_observations()
 
-    # ------------ reward functions----------------
+    # Reward functions.
     def _reward_target(self):
         target_rew = torch.sum(torch.square(self.last_rel_pos), dim=1) - torch.sum(torch.square(self.rel_pos), dim=1)
         return target_rew
